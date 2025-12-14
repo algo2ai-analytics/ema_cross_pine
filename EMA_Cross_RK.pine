@@ -1,0 +1,185 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © retaish_kumarci
+
+//@version=6
+strategy("EMA – Cross (RK)", overlay=true,
+     initial_capital = 1000000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 1,
+     pyramiding = 0,
+     commission_type = strategy.commission.percent,
+     commission_value = 0)
+
+//──────────────────────────────────────────────────────────────
+// Inputs
+//──────────────────────────────────────────────────────────────
+groupTrade = "Trading"
+qty_lot    = input.float(10, "Order Qty (lots/shares)", step=1, group=groupTrade)
+
+groupRange = "Date Range"
+// use_range  = input.bool(true, "Use Date Range", group=groupRange)
+// tz         = input.string("GMT+5:30", "Timestamp TZ", group=groupRange)
+
+
+
+// ─────────────────────────────────────────────
+// CONST timestamps (compile-time)
+// ─────────────────────────────────────────────
+const int START_TS = 1577836800000  // 2020-01-01 00:00 UTC
+const int END_TS   = 1762776000000  // 2025-11-10 12:00 UTC
+
+// ─────────────────────────────────────────────
+// Inputs
+// ─────────────────────────────────────────────
+use_range = input.bool(true, "Use Date Range")
+
+start_time = input.time(
+     defval = START_TS,
+     title  = "Start",
+     confirm = true)
+
+end_time = input.time(
+     defval = END_TS,
+     title  = "End",
+     confirm = true)
+
+// ─────────────────────────────────────────────
+// Gate
+// ─────────────────────────────────────────────
+inRange = not use_range or (time >= start_time and time <= end_time)
+
+groupRisk  = "Risk"
+openLossLimitPct = input.float(1.0, "Set 1: Open Loss Limit (%)", step=0.1, group=groupRisk)
+lastLossLimitPct = input.float(1.0, "Set 2: Last Closed Trade Loss Limit (%)", step=0.1, group=groupRisk)
+cooldownBars     = input.int(0, "Cooldown bars after last-loss breach (0 = off)", minval=0, group=groupRisk)
+
+//──────────────────────────────────────────────────────────────
+// In-range gate
+//──────────────────────────────────────────────────────────────
+// inRange = not use_range or (time >= start_time and time <= end_time)
+
+//──────────────────────────────────────────────────────────────
+// Indicators
+//──────────────────────────────────────────────────────────────
+ema20  = ta.ema(close, 20)
+ema50  = ta.ema(close, 50)
+ema75  = ta.ema(close, 75)
+ema100 = ta.ema(close, 100)
+ema150 = ta.ema(close, 150)
+ema200 = ta.ema(close, 200)
+
+rsi_short    = ta.rsi(close, 14)
+rsi_long     = ta.rsi(close, 28)
+rsi_longplus = ta.rsi(close, 56)
+
+atr_short    = ta.atr(14)
+atr_long     = ta.atr(28)
+atr_longplus = ta.atr(56)
+
+[bbatr_m, bbatr_u, bbatr_d] = ta.bb(atr_short, 28, 1)
+
+bbLen    = input.int(28, "BB Length")
+bbMult   = input.float(2.0, "BB Mult", step=0.1)
+
+[bb_m, bb_u, bb_d] = ta.bb(close, bbLen, bbMult)
+
+
+//──────────────────────────────────────────────────────────────
+// Signals (your original logic, cleaned)
+// NOTE: you used OR between comparisons; leaving as-is.
+//──────────────────────────────────────────────────────────────
+longEmaCond  = (ema20 > ema50)  or (ema50 > ema75)  or (ema75 > ema100) or (ema100 > ema150) or (ema150 > ema200)
+shortEmaCond = (ema20 < ema50)  or (ema50 < ema75)  or (ema75 < ema100) or (ema100 < ema150) or (ema150 < ema200)
+
+longRsiCond = true
+shortRsiCond = true
+atrCond = true
+longRsiCond  := (rsi_short > rsi_long) //or (rsi_long > rsi_longplus)
+shortRsiCond := (rsi_short < rsi_long) //or (rsi_long < rsi_longplus)
+
+atrCond      := (atr_short < atr_long) //or (atr_long < atr_longplus)
+
+longCond  = longEmaCond  and longRsiCond  and atrCond
+shortCond = shortEmaCond and shortRsiCond and atrCond
+
+//──────────────────────────────────────────────────────────────
+// Set 2: Detect last closed trade loss % (trade-level)
+// Then optionally block new entries for N bars (cooldown).
+//──────────────────────────────────────────────────────────────
+var int   prevClosedCnt   = na
+var int   cooldownUntil   = na
+var float lastTradePct    = na
+
+if na(prevClosedCnt)
+    prevClosedCnt := strategy.closedtrades
+
+newClosed = strategy.closedtrades > prevClosedCnt
+
+if newClosed
+    int   i   = strategy.closedtrades - 1
+    float ep  = strategy.closedtrades.entry_price(i)
+    float sz  = strategy.closedtrades.size(i)
+    float pnl = strategy.closedtrades.profit(i)
+
+    // Approx trade notional in account currency.
+    // For most cash markets: abs(size)*entry_price is OK.
+    // pointvalue helps for derivatives.
+    float tradeValue = math.abs(sz) * ep * syminfo.pointvalue
+    lastTradePct := tradeValue != 0 ? (pnl / tradeValue) * 100.0 : na
+
+    bool breached = not na(lastTradePct) and lastTradePct <= -lastLossLimitPct
+    if breached
+        // if you want: immediately flatten (if something is open)
+        strategy.close("Long",  comment="Last trade loss breach")
+        strategy.close("Short", comment="Last trade loss breach")
+
+        // cooldown gate for next entries (recommended)
+        if cooldownBars > 0
+            cooldownUntil := bar_index + cooldownBars
+
+prevClosedCnt := strategy.closedtrades
+
+cooldownActive = cooldownBars > 0 and not na(cooldownUntil) and bar_index <= cooldownUntil
+
+//──────────────────────────────────────────────────────────────
+// Trading logic (flip cleanly) + gates
+//──────────────────────────────────────────────────────────────
+canTrade = inRange and not cooldownActive
+
+if canTrade
+    if longCond
+        strategy.entry("Long", strategy.long, qty=qty_lot)
+        strategy.close("Short")
+    if shortCond
+        strategy.entry("Short", strategy.short, qty=qty_lot)
+        strategy.close("Long")
+
+//──────────────────────────────────────────────────────────────
+// Set 1: Open loss limit (your original behavior)
+//──────────────────────────────────────────────────────────────
+if strategy.openprofit_percent < -openLossLimitPct
+    strategy.close("Long",  comment="Open loss limit")
+    strategy.close("Short", comment="Open loss limit")
+
+
+// plot technicals
+plot(ema20, "ema20", color=color.new(color.teal, 0), linewidth=1)
+plot(ema50, "ema50", color=color.new(#a32a67, 0), linewidth=1)
+plot(bb_m, "bb_m", color=color.new(color.yellow, 0), linewidth=1)
+plot(bb_u, "bb_u", color=color.new(color.purple, 0), linewidth=1)
+plot(bb_d, "bb_d", color=color.new(color.orange, 0), linewidth=1)
+
+
+// plot to display in different pane (on premium version)
+plot(atr_short, "atr_short", color=color.new(color.yellow, 0), linewidth=1, display = display.status_line)
+plot(atr_longplus, "atr_longplus", color=color.new(color.red, 0), linewidth=1)
+plot(bbatr_m, "bbatr_m", color=color.new(color.yellow, 0), linewidth=1)
+plot(bbatr_u, "bbatr_u", color=color.new(color.green, 0), linewidth=1)
+plot(bbatr_d, "bbatr_d", color=color.new(color.red, 0), linewidth=1)
+
+
+
+
+// Optional debug plot in Data Window
+plot(lastTradePct, "Last Trade % (approx)", display=display.data_window)
+plotchar(cooldownActive, "Cooldown Active", "⏸", location=location.top, display=display.data_window)
